@@ -28,6 +28,14 @@ services:
         condition: service_healthy
     environment:
       API_BASE_URL: http://api:8000
+      # 与 api 服务同一 SQLite 文件：验收末尾以全新仓库实例重开该文件，
+      # 模拟服务重启后核对作废证据与重算结果一致
+      RESTART_DB_PATH: /srv/app/data/calibration.db
+    volumes:
+      # 挂入同一命名卷：验收末尾以全新仓库实例重开同一 SQLite 文件
+      # （只读用途，但 WAL 需要写 -wal/-shm，故不能只读挂载），
+      # 模拟服务重启后核对作废证据与重算结果一致
+      - calibration-data:/srv/app/data
     command: ["sh", "-c", "python -m pytest -q && python -m verify.acceptance"]
     restart: "no"
 

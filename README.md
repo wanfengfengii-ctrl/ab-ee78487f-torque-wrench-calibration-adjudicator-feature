@@ -43,7 +43,8 @@ docker compose up --build --exit-code-from verify --abort-on-container-exit veri
 
 `verify` 服务等待 `api` 健康后运行，验收内容：同一临界输入重复请求
 响应逐字节一致、非法样本仅返回结构化错误、双项超限同时暴露两个原因、
-边界相等判合格。全部通过时退出码为 0。
+边界相等判合格、误登记作废后按剩余有效历史重算（含重启一致性核对）。
+全部通过时退出码为 0。
 
 ### 本地运行（Python 3.12）
 
@@ -55,7 +56,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 运行测试
 
 ```bash
-python -m pytest          # 计算、错误链路、批量与校准档案共 125 项测试
+python -m pytest          # 计算、错误链路、批量、校准档案与作废共 160 项测试
 API_BASE_URL=http://localhost:8000 python -m verify.acceptance   # 黑盒验收
 ```
 
@@ -226,6 +227,64 @@ curl -X POST http://localhost:8000/api/v1/wrenches/TW-0001/calibrations \
 `CALIBRATION_DB_PATH` 覆盖；docker compose 下挂载为命名卷
 `calibration-data`）。
 
+### `DELETE /api/v1/wrenches/{wrench_sn}/calibrations/{seq}` — 作废一次误登记
+
+生产现场偶尔会把有效读数登记到错误扳手。误登记**不做物理删除**
+（删除会丢失审计证据）：按扳手编号与登记序号**软作废**，接收 1–200 字
+原因（strip 后计长），保留原快照；随后领域服务按登记顺序**重放**该
+档案中仍有效的判定，重新计算当前健康状态与连续不合格次数。
+
+```bash
+curl -X DELETE http://localhost:8000/api/v1/wrenches/TW-0001/calibrations/3 \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "有效读数误登记到错误扳手编号，按现场单据作废。"}'
+```
+
+响应返回**被作废序号**与**重算后的档案摘要**：
+
+```json
+{
+  "wrench_sn": "TW-0001",
+  "voided_seq": 3,
+  "voided_at": "2026-09-18T00:00:34+00:00",
+  "reason": "有效读数误登记到错误扳手编号，按现场单据作废。",
+  "status": "observation",
+  "consecutive_fail_count": 1,
+  "total_records": 3
+}
+```
+
+- 标记记录（写入原因与作废时间）、更新档案行在**同一个
+  `BEGIN IMMEDIATE` 事务**内完成，二者原子提交；序号继续在含作废
+  记录之上递增，**不复用作废序号**。
+- 重放把剩余有效记录视为该扳手自建档以来的全部复核，逐条套用与
+  登记完全相同的状态机；没有任何有效记录时回到在用、计数 0。
+  例：`pass, fail, fail`（停用/2）作废末次不合格后重放为
+  `pass, fail`（观察/1）；作废中间记录（如 `fail, fail, pass, fail`
+  中的合格项）则按剩余历史 `fail, fail, fail` 重算为停用/3。
+- **查询仍返回完整历史**（含已作废记录，`total_records` 不减少）：
+  每条记录补充 `is_valid`（布尔）与 `voided_at` / `void_reason`
+  （未作废时为 `null`），已作废记录的原快照字段保持不变。
+
+```json
+{"seq": 3, "registered_at": "…", "overall": "fail", "...": "…",
+ "is_valid": false,
+ "voided_at": "2026-09-18T00:00:34+00:00",
+ "void_reason": "有效读数误登记到错误扳手编号，按现场单据作废。"}
+```
+
+错误契约（结构化、无档案数据泄露）：
+
+| 情形 | 状态码 | `error.code` |
+| --- | --- | --- |
+| 原因空/纯空白/超过 200 字/非字符串/缺字段/多余字段 | 422 | `VALIDATION_ERROR`（写入前整体拒绝） |
+| 扳手档案不存在 | 404 | `WRENCH_NOT_FOUND` |
+| 档案存在但序号不存在（含非正整数序号） | 404 | `CALIBRATION_RECORD_NOT_FOUND` |
+| 该序号已作废（重复作废） | 409 | `CALIBRATION_RECORD_ALREADY_VOIDED`（不改动档案） |
+
+非法原因在契约层整体拒绝，不开写事务、不留任何痕迹；序号不存在与
+重复作废均回滚事务，档案状态、历史与既有作废证据保持不变。
+
 ### 示例
 
 ```bash
@@ -259,6 +318,12 @@ curl -X POST http://localhost:8000/api/v1/wrenches/TW-0001/calibrations \
 
 # 查询该扳手的当前状态、连续不合格次数与完整判定历史
 curl http://localhost:8000/api/v1/wrenches/TW-0001/calibrations
+
+# 发现上面的登记属于误登记：按扳手编号 + 登记序号作废（保留快照审计证据），
+# 领域服务重放仍有效的判定并重算健康状态
+curl -X DELETE http://localhost:8000/api/v1/wrenches/TW-0001/calibrations/1 \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "有效读数误登记到错误扳手编号，按现场单据作废。"}'
 ```
 
 ### 结构化错误（HTTP 422 / 404）
@@ -316,6 +381,7 @@ tests/
   test_api.py           # 错误链路与 API 行为（含临界精度解析）
   test_batch.py         # 批量复核：编排汇总、逐项等价、整体拒绝（含临界精度）
   test_calibration.py   # 校准档案：建档、状态迁移、清零恢复、非法不写入、隔离、持久化
+  test_void.py          # 误登记作废：末次/中间作废重算、冲突无副作用、结构化未找到、原因拒绝、重启一致
 verify/
   acceptance.py     # 一次性黑盒验收（docker compose 的 verify 服务）
 Dockerfile

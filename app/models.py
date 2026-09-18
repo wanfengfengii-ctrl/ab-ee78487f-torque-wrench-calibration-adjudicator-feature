@@ -117,10 +117,16 @@ class CalibrationRecordResponse(TorqueVerifyResponse):
 
     继承 :class:`TorqueVerifyResponse`，故快照字段与单次/批量接口
     完全一致（含 ``overall`` 与 ``failure_reasons``）。
+
+    作废不删除记录：``is_valid`` 标识该登记是否仍参与健康状态重算，
+    作废时补充 ``voided_at`` / ``void_reason``，原快照字段保持不变。
     """
 
     seq: int
     registered_at: str
+    is_valid: bool
+    voided_at: str | None = None
+    void_reason: str | None = None
 
 
 class CalibrationRegisterResponse(CalibrationRecordResponse):
@@ -131,8 +137,53 @@ class CalibrationRegisterResponse(CalibrationRecordResponse):
     consecutive_fail_count: int
 
 
+#: 作废原因长度上下限（按 strip 后的字符数计）
+VOID_REASON_MIN_LEN = 1
+VOID_REASON_MAX_LEN = 200
+
+
+def _void_reason_validator(value: str) -> str:
+    """校验作废原因：去掉首尾空白后须为 1–200 字的非空字符串。"""
+    value = value.strip()
+    if not value:
+        raise ValueError("void reason must be a non-empty string")
+    if len(value) > VOID_REASON_MAX_LEN:
+        raise ValueError(
+            f"void reason must be at most {VOID_REASON_MAX_LEN} characters"
+        )
+    return value
+
+
+#: 合法作废原因：字符串，strip 后 1–200 字
+VoidReason = Annotated[StrictStr, AfterValidator(_void_reason_validator)]
+
+
+class CalibrationVoidRequest(BaseModel):
+    """作废请求：1–200 字的误登记原因（写入前校验，非法整体拒绝）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: VoidReason
+
+
+class CalibrationVoidResponse(BaseModel):
+    """作废响应：被作废序号 + 重算后的档案摘要（含作废证据）。"""
+
+    wrench_sn: str
+    voided_seq: int
+    voided_at: str
+    reason: str
+    status: WrenchStatus
+    consecutive_fail_count: int
+    total_records: int
+
+
 class CalibrationProfileResponse(BaseModel):
-    """按扳手编号查询的档案视图：当前状态 + 按登记顺序排列的完整历史。"""
+    """按扳手编号查询的档案视图：当前状态 + 按登记顺序排列的完整历史。
+
+    ``history`` 仍包含已作废记录（完整审计历史），每条以 ``is_valid``
+    及作废信息区分；``total_records`` 为含作废记录在内的历史总数。
+    """
 
     wrench_sn: str
     status: WrenchStatus

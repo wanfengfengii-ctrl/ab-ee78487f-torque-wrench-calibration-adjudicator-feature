@@ -10,7 +10,12 @@
    与单次接口等价、非法测点整体拒绝且不产生部分结果；
 7. 校准档案纵向闭环：首次合格建档、两次连续不合格
    （在用→观察→停用）、合格后计数清零并恢复在用、非法读数不写入
-   记录也不改变既有状态、未知编号结构化 404 且不泄露其他档案。
+   记录也不改变既有状态、未知编号结构化 404 且不泄露其他档案；
+8. 误登记作废：作废末次不合格后状态恢复、作废中间记录按剩余有效
+   历史重算、重复作废返回冲突且无副作用、序号/档案未找到返回不泄露
+   档案的结构化 404、非法原因写入前整体拒绝、历史保留作废证据；
+   设置 RESTART_DB_PATH（与 API 同一 SQLite 文件）时，额外用全新
+   服务实例确认“重启”后作废证据与重算结果一致。
 
 通过环境变量 API_BASE_URL 指向被验 API（默认 http://localhost:8000）。
 全部通过退出码为 0，否则为 1。
@@ -29,10 +34,17 @@ import httpx
 BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
 URL = f"{BASE_URL}/api/v1/torque/verify"
 BATCH_URL = f"{BASE_URL}/api/v1/torque/verify/batch"
+#: 与被验 API 共享的 SQLite 文件路径（docker compose 下挂同一命名卷）；
+#: 设置后用全新仓库实例模拟服务重启，核对作废证据与重算结果。
+RESTART_DB_PATH = os.environ.get("RESTART_DB_PATH")
 
 
 def cal_url(wrench_sn: str) -> str:
     return f"{BASE_URL}/api/v1/wrenches/{wrench_sn}/calibrations"
+
+
+def void_url(wrench_sn: str, seq: int) -> str:
+    return f"{cal_url(wrench_sn)}/{seq}"
 
 _failures: list[str] = []
 
@@ -416,6 +428,229 @@ def main() -> int:
         f"HTTP {resp.status_code}",
     )
 
+    # 7. 误登记作废（每次验收使用全新唯一编号，保证可重复运行）
+    void_sn = f"VOID-{uuid.uuid4().hex[:12]}"
+    v_url = cal_url(void_sn)
+    void_reason = "有效读数误登记到错误扳手编号，按现场单据作废。"
+
+    # 7a. 未知扳手作废：结构化 404（WRENCH_NOT_FOUND），不泄露其他档案
+    resp = httpx.request(
+        "DELETE",
+        void_url(f"GHOST-{uuid.uuid4().hex[:8]}", 1),
+        json={"reason": void_reason},
+        timeout=5.0,
+    )
+    try:
+        nf = resp.json()
+        nf_ok = (
+            resp.status_code == 404
+            and nf.get("error", {}).get("code") == "WRENCH_NOT_FOUND"
+            and "history" not in nf
+            and "status" not in nf
+        )
+    except (ValueError, AttributeError):
+        nf_ok = False
+    check("作废：未知扳手返回结构化 404 且不含档案数据", nf_ok, f"HTTP {resp.status_code}")
+
+    # 7b. 造历史：pass, fail, fail → 停用/2
+    httpx.post(v_url, json=passing, timeout=5.0)
+    httpx.post(v_url, json=critical, timeout=5.0)
+    httpx.post(v_url, json=dual, timeout=5.0)
+    before_void = httpx.get(v_url, timeout=5.0).json()
+    check(
+        "作废：准备数据为停用、连续不合格 2、共 3 条",
+        before_void.get("status") == "out_of_service"
+        and before_void.get("consecutive_fail_count") == 2
+        and before_void.get("total_records") == 3,
+        f"status={before_void.get('status')}",
+    )
+
+    # 7c. 序号不存在：结构化 404（CALIBRATION_RECORD_NOT_FOUND），档案不变
+    resp = httpx.request(
+        "DELETE", void_url(void_sn, 99), json={"reason": void_reason}, timeout=5.0
+    )
+    try:
+        body = resp.json()
+        seq_nf_ok = (
+            resp.status_code == 404
+            and body.get("error", {}).get("code") == "CALIBRATION_RECORD_NOT_FOUND"
+            and "history" not in body
+            and "status" not in body
+        )
+    except (ValueError, AttributeError):
+        seq_nf_ok = False
+    check("作废：不存在序号返回结构化 404 且不含档案数据", seq_nf_ok, f"HTTP {resp.status_code}")
+    unchanged = httpx.get(v_url, timeout=5.0).json()
+    check(
+        "作废：序号不存在不改动档案",
+        unchanged == before_void,
+    )
+
+    # 7d. 作废末次不合格（seq=3）：重放剩余 pass, fail → 观察/1
+    resp = httpx.request(
+        "DELETE", void_url(void_sn, 3), json={"reason": void_reason}, timeout=5.0
+    )
+    voided = resp.json()
+    check(
+        "作废：作废末次不合格后恢复为观察、计数 1",
+        resp.status_code == 200
+        and voided.get("voided_seq") == 3
+        and voided.get("wrench_sn") == void_sn
+        and voided.get("reason") == void_reason
+        and bool(voided.get("voided_at"))
+        and voided.get("status") == "observation"
+        and voided.get("consecutive_fail_count") == 1
+        and voided.get("total_records") == 3,
+        f"status={voided.get('status')} count={voided.get('consecutive_fail_count')}",
+    )
+
+    # 7e. 查询仍返回完整历史：每条补充 is_valid 及作废信息，原字段不变
+    profile_v = httpx.get(v_url, timeout=5.0).json()
+    history_v = profile_v.get("history", [])
+    evidence_ok = (
+        [h.get("seq") for h in history_v] == [1, 2, 3]
+        and [h.get("is_valid") for h in history_v] == [True, True, False]
+        and history_v[2].get("voided_at") == voided.get("voided_at")
+        and history_v[2].get("void_reason") == void_reason
+        and history_v[0].get("voided_at") is None
+        and history_v[0].get("void_reason") is None
+        and history_v[2].get("overall") == "fail"
+        and history_v[2].get("failure_reasons")
+        == ["deviation_pct_out_of_limit", "range_pct_out_of_limit"]
+    )
+    check(
+        "作废：完整历史保留快照并为每条补充有效性/作废信息",
+        evidence_ok,
+        f"is_valid={[h.get('is_valid') for h in history_v]}",
+    )
+
+    # 7f. 重复作废：409 冲突且无副作用（原因、作废时刻、档案均不变）
+    resp = httpx.request(
+        "DELETE",
+        void_url(void_sn, 3),
+        json={"reason": "另一条重复作废原因不应被写入"},
+        timeout=5.0,
+    )
+    try:
+        conflict_body = resp.json()
+        conflict_ok = (
+            resp.status_code == 409
+            and conflict_body.get("error", {}).get("code")
+            == "CALIBRATION_RECORD_ALREADY_VOIDED"
+        )
+    except (ValueError, AttributeError):
+        conflict_ok = False
+    check("作废：重复作废返回 409 冲突", conflict_ok, f"HTTP {resp.status_code}")
+    after_conflict = httpx.get(v_url, timeout=5.0).json()
+    check(
+        "作废：重复作废不改动档案与作废证据",
+        after_conflict == profile_v,
+    )
+
+    # 7g. 作废中间记录：另建 fail, fail, pass, fail（观察/1），作废中间的
+    #     合格 seq=3 → 剩余 fail, fail, fail 重放为停用/3
+    mid_sn = f"MID-{uuid.uuid4().hex[:12]}"
+    m_url = cal_url(mid_sn)
+    for item in (critical, dual, passing, critical):
+        httpx.post(m_url, json=item, timeout=5.0)
+    mid_before = httpx.get(m_url, timeout=5.0).json()
+    check(
+        "作废（中间）：准备数据为观察、计数 1",
+        mid_before.get("status") == "observation"
+        and mid_before.get("consecutive_fail_count") == 1,
+    )
+    resp = httpx.request(
+        "DELETE", void_url(mid_sn, 3), json={"reason": void_reason}, timeout=5.0
+    )
+    mid_void = resp.json()
+    check(
+        "作废：作废中间合格记录后按剩余历史重算为停用、计数 3",
+        resp.status_code == 200
+        and mid_void.get("voided_seq") == 3
+        and mid_void.get("status") == "out_of_service"
+        and mid_void.get("consecutive_fail_count") == 3
+        and mid_void.get("total_records") == 4,
+        f"status={mid_void.get('status')} count={mid_void.get('consecutive_fail_count')}",
+    )
+    mid_after = httpx.get(m_url, timeout=5.0).json()
+    check(
+        "作废（中间）：查询结果与重算摘要一致且仅 seq=3 被标记",
+        mid_after.get("status") == "out_of_service"
+        and mid_after.get("consecutive_fail_count") == 3
+        and [h.get("is_valid") for h in mid_after.get("history", [])]
+        == [True, True, False, True],
+    )
+
+    # 7h. 非法原因：写入前整体拒绝（422），档案与记录不变
+    invalid_reasons = {
+        "空原因": "",
+        "纯空白原因": "   ",
+        f"超过 200 字（{201} 字）": "x" * 201,
+        "非字符串原因": None,
+        "缺少 reason 字段": "__MISSING__",
+    }
+    for name, value in invalid_reasons.items():
+        payload = {} if value == "__MISSING__" else {"reason": value}
+        resp = httpx.request(
+            "DELETE", void_url(mid_sn, 1), json=payload, timeout=5.0
+        )
+        try:
+            body = resp.json()
+            reason_ok = (
+                resp.status_code == 422
+                and body.get("error", {}).get("code") == "VALIDATION_ERROR"
+            )
+        except (ValueError, AttributeError):
+            reason_ok = False
+        check(f"作废：非法原因写入前整体拒绝：{name}", reason_ok, f"HTTP {resp.status_code}")
+    check(
+        "作废：非法原因未改动既有档案",
+        httpx.get(m_url, timeout=5.0).json() == mid_after,
+    )
+
+    # 7i. 重启一致性：用全新仓库实例打开同一 SQLite 文件，作废证据与
+    #     重算结果必须与 API 进程中的视图逐字段一致。
+    restart_ok = None
+    if RESTART_DB_PATH and os.path.exists(RESTART_DB_PATH):
+        from app.calibration import CalibrationService
+        from app.db import CalibrationRepository
+
+        reopened = CalibrationService(CalibrationRepository(RESTART_DB_PATH))
+
+        def _restart_check(sn: str, expected_status: str, expected_count: int) -> dict:
+            profile = reopened.get_profile(sn).model_dump()
+            live = httpx.get(cal_url(sn), timeout=5.0).json()
+            same = profile == live
+            return {
+                "same": same,
+                "status": profile.get("status"),
+                "count": profile.get("consecutive_fail_count"),
+                "expected_status": expected_status,
+                "expected_count": expected_count,
+            }
+
+        r_void = _restart_check(void_sn, "observation", 1)
+        restart_ok = (
+            r_void["same"]
+            and r_void["status"] == "observation"
+            and r_void["count"] == 1
+        )
+        check(
+            "作废：重启后作废证据与重算结果一致（末次作废档）",
+            restart_ok,
+            f"status={r_void['status']} count={r_void['count']} same={r_void['same']}",
+        )
+        r_mid = _restart_check(mid_sn, "out_of_service", 3)
+        check(
+            "作废：重启后作废证据与重算结果一致（中间作废档）",
+            r_mid["same"]
+            and r_mid["status"] == "out_of_service"
+            and r_mid["count"] == 3,
+            f"status={r_mid['status']} count={r_mid['count']} same={r_mid['same']}",
+        )
+    else:
+        print("[SKIP] 未提供 RESTART_DB_PATH，跳过重库重启一致性核对", flush=True)
+
     print("\n临界样本证据（五次请求一致）:", flush=True)
     print(json.dumps(critical_body, ensure_ascii=False, indent=2), flush=True)
     print("\n混合批次汇总证据:", flush=True)
@@ -439,6 +674,60 @@ def main() -> int:
                     {"seq": h.get("seq"), "overall": h.get("overall")}
                     for h in history
                 ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        flush=True,
+    )
+    print("\n误登记作废证据（含重算档案摘要）:", flush=True)
+    print(
+        json.dumps(
+            {
+                "voided_last": {
+                    "wrench_sn": void_sn,
+                    "response": {
+                        k: voided.get(k)
+                        for k in (
+                            "voided_seq",
+                            "voided_at",
+                            "reason",
+                            "status",
+                            "consecutive_fail_count",
+                            "total_records",
+                        )
+                    },
+                    "history": [
+                        {
+                            "seq": h.get("seq"),
+                            "overall": h.get("overall"),
+                            "is_valid": h.get("is_valid"),
+                            "voided_at": h.get("voided_at"),
+                            "void_reason": h.get("void_reason"),
+                        }
+                        for h in history_v
+                    ],
+                },
+                "voided_middle": {
+                    "wrench_sn": mid_sn,
+                    "response": {
+                        k: mid_void.get(k)
+                        for k in (
+                            "voided_seq",
+                            "status",
+                            "consecutive_fail_count",
+                            "total_records",
+                        )
+                    },
+                    "history": [
+                        {
+                            "seq": h.get("seq"),
+                            "overall": h.get("overall"),
+                            "is_valid": h.get("is_valid"),
+                        }
+                        for h in mid_after.get("history", [])
+                    ],
+                },
             },
             ensure_ascii=False,
             indent=2,
