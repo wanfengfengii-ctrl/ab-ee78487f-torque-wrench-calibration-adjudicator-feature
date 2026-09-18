@@ -4,6 +4,8 @@
 以**十进制定点**（`decimal.Decimal`）完成全部计算与判定，杜绝浮点误差
 导致临界样本在不同终端得到相反结论。复核结果可按**扭矩扳手编号**登记，
 形成可追溯的设备健康档案，由连续结果自动给出**在用 / 观察 / 停用**状态。
+误登记到错误扳手的读数可按**编号 + 登记序号作废**：原快照与作废原因
+全部保留（审计证据不丢失），档案状态按仍有效的历史自动重算。
 
 ## 计算规则
 
@@ -55,7 +57,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 运行测试
 
 ```bash
-python -m pytest          # 计算、错误链路、批量与校准档案共 125 项测试
+python -m pytest          # 计算、错误链路、批量、校准档案与作废共 163 项测试
 API_BASE_URL=http://localhost:8000 python -m verify.acceptance   # 黑盒验收
 ```
 
@@ -174,6 +176,9 @@ curl -X POST http://localhost:8000/api/v1/wrenches/TW-0001/calibrations \
   "failure_reasons": [],
   "seq": 1,
   "registered_at": "2026-09-14T03:18:19+00:00",
+  "is_valid": true,
+  "void_reason": null,
+  "voided_at": null,
   "wrench_sn": "TW-0001",
   "status": "in_service",
   "consecutive_fail_count": 0
@@ -203,7 +208,9 @@ curl -X POST http://localhost:8000/api/v1/wrenches/TW-0001/calibrations \
 ### `GET /api/v1/wrenches/{wrench_sn}/calibrations` — 查询健康档案
 
 返回当前状态、连续不合格次数，以及**按登记顺序**排列的完整判定历史
-（`seq` 从 1 起连续递增，每条含登记时刻与完整单次判定字段）：
+（`seq` 从 1 起连续递增，每条含登记时刻与完整单次判定字段）。历史
+包含已作废记录——作废不删除快照，每条记录补充 `is_valid` 及作废信息
+（`void_reason` / `voided_at`），未作废记录的原字段保持不变：
 
 ```json
 {
@@ -212,9 +219,12 @@ curl -X POST http://localhost:8000/api/v1/wrenches/TW-0001/calibrations \
   "consecutive_fail_count": 2,
   "total_records": 3,
   "history": [
-    {"seq": 1, "registered_at": "…", "overall": "pass", "...": "…"},
-    {"seq": 2, "registered_at": "…", "overall": "fail", "...": "…"},
-    {"seq": 3, "registered_at": "…", "overall": "fail", "...": "…"}
+    {"seq": 1, "registered_at": "…", "is_valid": true, "void_reason": null,
+     "voided_at": null, "overall": "pass", "...": "…"},
+    {"seq": 2, "registered_at": "…", "is_valid": true, "void_reason": null,
+     "voided_at": null, "overall": "fail", "...": "…"},
+    {"seq": 3, "registered_at": "…", "is_valid": true, "void_reason": null,
+     "voided_at": null, "overall": "fail", "...": "…"}
   ]
 }
 ```
@@ -225,6 +235,46 @@ curl -X POST http://localhost:8000/api/v1/wrenches/TW-0001/calibrations \
 档案使用应用内 SQLite 持久化（默认 `data/calibration.db`，可用环境变量
 `CALIBRATION_DB_PATH` 覆盖；docker compose 下挂载为命名卷
 `calibration-data`）。
+
+### `POST /api/v1/wrenches/{wrench_sn}/calibrations/{seq}/void` — 作废误登记
+
+生产现场偶尔会把有效读数登记到错误扳手；直接删除会丢失审计证据，因此
+作废只打标记、**保留原快照**。请求体为一至二百字的原因（`reason`，
+首尾空白不计）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/wrenches/TW-0001/calibrations/3/void \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "误登记到错误扳手，实际读数属于另一台设备"}'
+```
+
+作废成功后，领域服务**按登记顺序重放该档案中仍有效的判定**，重新计算
+当前健康状态与连续不合格次数（作废末次不合格可恢复状态，作废中间记录
+同样按剩余历史重算；全部作废则回到在用/0）。响应返回被作废序号及
+重算后的档案摘要：
+
+```json
+{
+  "wrench_sn": "TW-0001",
+  "voided_seq": 3,
+  "void_reason": "误登记到错误扳手，实际读数属于另一台设备",
+  "voided_at": "2026-09-18T00:03:09+00:00",
+  "status": "observation",
+  "consecutive_fail_count": 1,
+  "total_records": 3,
+  "valid_records": 2
+}
+```
+
+SQLite 在**同一事务**内标记记录、保存原因和作废时间并更新档案；查询
+接口仍返回完整历史。错误情形（均不改动档案）：
+
+- 序号不存在（或编号未建档）：HTTP 404，
+  `error.code = "CALIBRATION_RECORD_NOT_FOUND"`，不泄露其他档案；
+- 重复作废同一序号：HTTP 409，
+  `error.code = "CALIBRATION_RECORD_ALREADY_VOIDED"`；
+- 原因非法（空白、超过 200 字、非字符串）：HTTP 422
+  `VALIDATION_ERROR`，在写入前整体拒绝。
 
 ### 示例
 
@@ -259,6 +309,11 @@ curl -X POST http://localhost:8000/api/v1/wrenches/TW-0001/calibrations \
 
 # 查询该扳手的当前状态、连续不合格次数与完整判定历史
 curl http://localhost:8000/api/v1/wrenches/TW-0001/calibrations
+
+# 作废误登记（保留快照与原因），按仍有效的历史重算档案状态
+curl -X POST http://localhost:8000/api/v1/wrenches/TW-0001/calibrations/1/void \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "误登记到错误扳手，实际读数属于另一台设备"}'
 ```
 
 ### 结构化错误（HTTP 422 / 404）
@@ -308,14 +363,15 @@ app/
   parsing.py        # 请求体精确 JSON 解析（数字直转 Decimal，不经 float64）
   models.py         # 请求/响应契约与输入约束（Pydantic，仅做声明与校验）
   serialization.py  # 复核结果 → 响应模型的唯一映射（单次/批量/档案共用）
-  db.py             # 应用内 SQLite 仓库（档案 + 复核快照，事务原子写入）
-  calibration.py    # 校准档案领域服务：状态迁移纯函数与登记/查询编排
+  db.py             # 应用内 SQLite 仓库（档案 + 复核快照，事务原子写入；作废审计列自动迁移）
+  calibration.py    # 校准档案领域服务：状态迁移/重放纯函数与登记/查询/作废编排
   main.py           # FastAPI 路由，只做编排
 tests/
   test_calculator.py    # 计算链路：边界、临界、舍入、确定性
   test_api.py           # 错误链路与 API 行为（含临界精度解析）
   test_batch.py         # 批量复核：编排汇总、逐项等价、整体拒绝（含临界精度）
   test_calibration.py   # 校准档案：建档、状态迁移、清零恢复、非法不写入、隔离、持久化
+  test_void.py          # 误登记作废：重放重算、审计保留、409/404/422、重启一致
 verify/
   acceptance.py     # 一次性黑盒验收（docker compose 的 verify 服务）
 Dockerfile

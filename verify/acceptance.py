@@ -10,7 +10,10 @@
    与单次接口等价、非法测点整体拒绝且不产生部分结果；
 7. 校准档案纵向闭环：首次合格建档、两次连续不合格
    （在用→观察→停用）、合格后计数清零并恢复在用、非法读数不写入
-   记录也不改变既有状态、未知编号结构化 404 且不泄露其他档案。
+   记录也不改变既有状态、未知编号结构化 404 且不泄露其他档案；
+8. 误登记作废闭环：作废末次不合格恢复状态、作废中间记录按剩余
+   历史重算、完整历史保留作废证据（原因/时间）、重复作废 409 无
+   副作用、非法原因 422 不写入、不存在序号 404 不泄露其他档案。
 
 通过环境变量 API_BASE_URL 指向被验 API（默认 http://localhost:8000）。
 全部通过退出码为 0，否则为 1。
@@ -33,6 +36,10 @@ BATCH_URL = f"{BASE_URL}/api/v1/torque/verify/batch"
 
 def cal_url(wrench_sn: str) -> str:
     return f"{BASE_URL}/api/v1/wrenches/{wrench_sn}/calibrations"
+
+
+def void_url(wrench_sn: str, seq: int) -> str:
+    return f"{cal_url(wrench_sn)}/{seq}/void"
 
 _failures: list[str] = []
 
@@ -416,6 +423,161 @@ def main() -> int:
         f"HTTP {resp.status_code}",
     )
 
+    # 7. 误登记作废闭环（全新唯一编号，与第 6 节档案互不影响）
+    void_sn = f"VOID-{uuid.uuid4().hex[:12]}"
+    v_url = cal_url(void_sn)
+    void_reason = "误登记到错误扳手，实际读数属于另一台设备"
+
+    # 7a. 准备历史：合格 → 不合格 → 不合格（在用→观察→停用）
+    for body in (passing, critical, dual):
+        httpx.post(v_url, json=body, timeout=5.0)
+    seeded = httpx.get(v_url, timeout=5.0).json()
+    check(
+        "作废：前置历史登记为停用且连续不合格 2 次",
+        seeded.get("status") == "out_of_service"
+        and seeded.get("consecutive_fail_count") == 2
+        and seeded.get("total_records") == 3,
+        f"status={seeded.get('status')}",
+    )
+
+    # 7b. 作废末次不合格（seq 3）：按剩余 [pass, fail] 重放 → 观察、计数 1
+    resp = httpx.post(
+        void_url(void_sn, 3), json={"reason": void_reason}, timeout=5.0
+    )
+    void_last = resp.json() if resp.status_code == 200 else {}
+    check(
+        "作废：末次不合格作废后按剩余历史重算为观察",
+        resp.status_code == 200
+        and void_last.get("wrench_sn") == void_sn
+        and void_last.get("voided_seq") == 3
+        and void_last.get("void_reason") == void_reason
+        and void_last.get("voided_at")
+        and void_last.get("status") == "observation"
+        and void_last.get("consecutive_fail_count") == 1
+        and void_last.get("total_records") == 3
+        and void_last.get("valid_records") == 2,
+        f"status={void_last.get('status')} count={void_last.get('consecutive_fail_count')}",
+    )
+
+    # 7c. 查询仍返回完整历史：作废记录带审计信息，未作废记录原字段不变
+    profile_v = httpx.get(v_url, timeout=5.0).json()
+    history_v = profile_v.get("history", [])
+    voided_record = history_v[2] if len(history_v) == 3 else {}
+    check(
+        "作废：完整历史保留，作废记录携带原因与作废时间",
+        profile_v.get("status") == "observation"
+        and profile_v.get("consecutive_fail_count") == 1
+        and profile_v.get("total_records") == 3
+        and [h.get("is_valid") for h in history_v] == [True, True, False]
+        and voided_record.get("void_reason") == void_reason
+        and voided_record.get("voided_at") == void_last.get("voided_at")
+        and voided_record.get("overall") == "fail"
+        and voided_record.get("failure_reasons")
+        == ["deviation_pct_out_of_limit", "range_pct_out_of_limit"]
+        and all(
+            h.get("void_reason") is None and h.get("voided_at") is None
+            for h in history_v[:2]
+        ),
+        f"is_valid={[h.get('is_valid') for h in history_v]}",
+    )
+
+    # 7d. 重复作废：409 冲突且档案无任何变化
+    resp = httpx.post(
+        void_url(void_sn, 3), json={"reason": "重复作废同一序号"}, timeout=5.0
+    )
+    try:
+        conflict = resp.json()
+        conflict_ok = (
+            resp.status_code == 409
+            and conflict.get("error", {}).get("code")
+            == "CALIBRATION_RECORD_ALREADY_VOIDED"
+            and isinstance(conflict.get("error", {}).get("details"), list)
+        )
+    except (ValueError, AttributeError):
+        conflict_ok = False
+    after_conflict = httpx.get(v_url, timeout=5.0).json()
+    check(
+        "作废：重复作废返回 409 且档案无副作用",
+        conflict_ok and after_conflict == profile_v,
+        f"HTTP {resp.status_code}",
+    )
+
+    # 7e. 作废中间记录（seq 2）：剩余 [pass] 重放 → 在用、计数 0
+    resp = httpx.post(
+        void_url(void_sn, 2), json={"reason": void_reason}, timeout=5.0
+    )
+    void_mid = resp.json() if resp.status_code == 200 else {}
+    check(
+        "作废：中间记录作废后按剩余历史重算为在用",
+        resp.status_code == 200
+        and void_mid.get("voided_seq") == 2
+        and void_mid.get("status") == "in_service"
+        and void_mid.get("consecutive_fail_count") == 0
+        and void_mid.get("valid_records") == 1,
+        f"status={void_mid.get('status')} count={void_mid.get('consecutive_fail_count')}",
+    )
+    profile_v2 = httpx.get(v_url, timeout=5.0).json()
+    check(
+        "作废：查询与重算结果一致，历史仍完整",
+        profile_v2.get("status") == "in_service"
+        and profile_v2.get("consecutive_fail_count") == 0
+        and profile_v2.get("total_records") == 3
+        and [h.get("is_valid") for h in profile_v2.get("history", [])]
+        == [True, False, False],
+    )
+
+    # 7f. 非法原因：空串与超长（201 字）均 422，且不写入任何标记
+    for bad_reason in ("", "x" * 201):
+        resp = httpx.post(
+            void_url(void_sn, 1), json={"reason": bad_reason}, timeout=5.0
+        )
+        try:
+            err = resp.json().get("error", {})
+            ok = resp.status_code == 422 and err.get("code") == "VALIDATION_ERROR"
+        except (ValueError, AttributeError):
+            ok = False
+        check(f"作废：非法原因整体拒绝（长度 {len(bad_reason)}）", ok,
+              f"HTTP {resp.status_code}")
+    after_bad_reason = httpx.get(v_url, timeout=5.0).json()
+    check(
+        "作废：非法原因不写入任何标记",
+        after_bad_reason == profile_v2,
+    )
+
+    # 7g. 不存在的序号：结构化 404，不泄露其他档案编号
+    resp = httpx.post(
+        void_url(void_sn, 99), json={"reason": void_reason}, timeout=5.0
+    )
+    try:
+        nf = resp.json()
+        ok = (
+            resp.status_code == 404
+            and nf.get("error", {}).get("code") == "CALIBRATION_RECORD_NOT_FOUND"
+            and isinstance(nf.get("error", {}).get("details"), list)
+            and "status" not in nf
+            and "history" not in nf
+            and cal_sn not in resp.text
+        )
+    except (ValueError, AttributeError):
+        ok = False
+    check("作废：不存在序号返回结构化 404 且不泄露其他档案", ok,
+          f"HTTP {resp.status_code}")
+
+    # 7h. 未知扳手作废：同样的 404 外形
+    resp = httpx.post(
+        void_url(f"NOPE-{uuid.uuid4().hex[:8]}", 1),
+        json={"reason": void_reason},
+        timeout=5.0,
+    )
+    check(
+        "作废：未知扳手返回 404 且响应不含其他档案编号",
+        resp.status_code == 404
+        and resp.json().get("error", {}).get("code")
+        == "CALIBRATION_RECORD_NOT_FOUND"
+        and void_sn not in resp.text,
+        f"HTTP {resp.status_code}",
+    )
+
     print("\n临界样本证据（五次请求一致）:", flush=True)
     print(json.dumps(critical_body, ensure_ascii=False, indent=2), flush=True)
     print("\n混合批次汇总证据:", flush=True)
@@ -438,6 +600,32 @@ def main() -> int:
                 "history": [
                     {"seq": h.get("seq"), "overall": h.get("overall")}
                     for h in history
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        flush=True,
+    )
+    print("\n误登记作废闭环证据（重算后的档案摘要）:", flush=True)
+    print(
+        json.dumps(
+            {
+                "wrench_sn": void_sn,
+                "voided_seq": void_mid.get("voided_seq"),
+                "status": profile_v2.get("status"),
+                "consecutive_fail_count": profile_v2.get(
+                    "consecutive_fail_count"
+                ),
+                "total_records": profile_v2.get("total_records"),
+                "history": [
+                    {
+                        "seq": h.get("seq"),
+                        "overall": h.get("overall"),
+                        "is_valid": h.get("is_valid"),
+                        "void_reason": h.get("void_reason"),
+                    }
+                    for h in profile_v2.get("history", [])
                 ],
             },
             ensure_ascii=False,

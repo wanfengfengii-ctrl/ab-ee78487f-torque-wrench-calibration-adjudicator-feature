@@ -111,16 +111,52 @@ def _wrench_id_validator(value: str) -> str:
 #: 合法扭矩扳手编号：必须为字符串，strip 后非空且不超过 64 字符
 WrenchId = Annotated[StrictStr, AfterValidator(_wrench_id_validator)]
 
+#: 登记序号路径参数：从 1 起的正整数
+SeqId = Annotated[int, Field(ge=1)]
+
+#: 作废原因最大长度（strip 后），一至二百字
+VOID_REASON_MAX_LEN = 200
+
+
+def _void_reason_validator(value: str) -> str:
+    """校验作废原因：非空白、去掉首尾空白后长度 1–200 字。"""
+    value = value.strip()
+    if not value:
+        raise ValueError("reason must be a non-empty string")
+    if len(value) > VOID_REASON_MAX_LEN:
+        raise ValueError(
+            f"reason must be at most {VOID_REASON_MAX_LEN} characters"
+        )
+    return value
+
+
+#: 合法作废原因：必须为字符串，strip 后长度 1–200
+VoidReason = Annotated[StrictStr, AfterValidator(_void_reason_validator)]
+
+
+class CalibrationVoidRequest(BaseModel):
+    """作废误登记请求：一至二百字原因（原快照保留，仅作审计标记）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: VoidReason
+
 
 class CalibrationRecordResponse(TorqueVerifyResponse):
-    """档案中的一条复核快照：登记序号、登记时刻 + 完整单次判定字段。
+    """档案中的一条复核快照：登记序号、登记时刻、作废审计信息
+    + 完整单次判定字段。
 
     继承 :class:`TorqueVerifyResponse`，故快照字段与单次/批量接口
-    完全一致（含 ``overall`` 与 ``failure_reasons``）。
+    完全一致（含 ``overall`` 与 ``failure_reasons``）。作废不删除
+    快照：``is_valid`` 为 false 的记录携带 ``void_reason`` 与
+    ``voided_at``；未作废记录的原字段保持不变，作废字段为 null。
     """
 
     seq: int
     registered_at: str
+    is_valid: bool = True
+    void_reason: str | None = None
+    voided_at: str | None = None
 
 
 class CalibrationRegisterResponse(CalibrationRecordResponse):
@@ -132,10 +168,27 @@ class CalibrationRegisterResponse(CalibrationRecordResponse):
 
 
 class CalibrationProfileResponse(BaseModel):
-    """按扳手编号查询的档案视图：当前状态 + 按登记顺序排列的完整历史。"""
+    """按扳手编号查询的档案视图：当前状态 + 按登记顺序排列的完整历史。
+
+    历史包含已作废记录（携带作废审计信息），``total_records`` 为全部
+    登记条数；档案状态与连续不合格次数只由仍有效的判定重放得出。
+    """
 
     wrench_sn: str
     status: WrenchStatus
     consecutive_fail_count: int
     total_records: int
     history: list[CalibrationRecordResponse]
+
+
+class CalibrationVoidResponse(BaseModel):
+    """作废响应：被作废序号与作废审计信息 + 重算后的档案摘要。"""
+
+    wrench_sn: str
+    voided_seq: int
+    void_reason: str
+    voided_at: str
+    status: WrenchStatus
+    consecutive_fail_count: int
+    total_records: int
+    valid_records: int

@@ -1,4 +1,4 @@
-"""校准档案领域服务：设备健康状态迁移与登记/查询编排。
+"""校准档案领域服务：设备健康状态迁移与登记/查询/作废编排。
 
 状态机完全由本模块的 :func:`transition` 承载，路由与契约层不做任何
 状态判定：
@@ -14,11 +14,16 @@
 随后在仓库的单个互斥写事务内原子完成「档案 upsert + 复核快照 insert」。
 非法读数在 Pydantic 契约层即被整体拒绝（HTTP 422），根本不会进入本
 服务，因此不会写入记录也不会改变既有状态。
+
+作废误登记不删除快照（保留审计证据）：在仓库的单个互斥写事务内原子
+完成「记录标记 + 原因/作废时间 + 档案状态回写」，其中档案状态由
+:func:`replay_profile` 按登记顺序重放该档案中**仍有效**的判定重新
+计算——作废末次不合格可恢复状态，作废中间记录同样按剩余历史重算。
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 
 from app.calculator import verify_torque
@@ -27,6 +32,7 @@ from app.models import (
     CalibrationProfileResponse,
     CalibrationRecordResponse,
     CalibrationRegisterResponse,
+    CalibrationVoidResponse,
     TorqueVerifyRequest,
 )
 from app.serialization import build_verify_response
@@ -48,6 +54,27 @@ class WrenchNotFoundError(LookupError):
         super().__init__(f"calibration profile not found: {wrench_sn}")
 
 
+class CalibrationRecordNotFoundError(LookupError):
+    """作废目标不存在（扳手未建档或序号不在档案中）。
+
+    路由层据此返回结构化 404；错误外形与未知扳手一致，不泄露其他档案。
+    """
+
+    def __init__(self, wrench_sn: str, seq: int) -> None:
+        self.wrench_sn = wrench_sn
+        self.seq = seq
+        super().__init__(f"calibration record not found: {wrench_sn}#{seq}")
+
+
+class RecordAlreadyVoidedError(RuntimeError):
+    """重复作废同一记录：路由层据此返回 409，档案保持不变。"""
+
+    def __init__(self, wrench_sn: str, seq: int) -> None:
+        self.wrench_sn = wrench_sn
+        self.seq = seq
+        super().__init__(f"calibration record already voided: {wrench_sn}#{seq}")
+
+
 def transition(
     profile: ProfileRow | None, passed: bool
 ) -> tuple[str, int]:
@@ -64,6 +91,28 @@ def transition(
         return STATUS_OUT_OF_SERVICE, new_count
     # 首次出现不合格 → 观察。
     return STATUS_OBSERVATION, new_count
+
+
+def replay_profile(records: Iterable[StoredRecord]) -> tuple[str, int]:
+    """按登记顺序重放仍有效的判定，重算 (状态, 连续不合格次数)。
+
+    作废后档案的当前状态不再依赖作废前的累计值，而是由剩余有效历史
+    从头重放得出，因此作废末次不合格可恢复状态、作废中间记录也按
+    剩余历史重算。空序列（全部作废）回到初始态：在用、计数 0——
+    没有任何有效判定时，档案不构成任何不合格证据。
+    """
+    profile: ProfileRow | None = None
+    status, count = STATUS_IN_SERVICE, 0
+    for record in records:
+        passed = record.snapshot["overall"] == "pass"
+        status, count = transition(profile, passed)
+        profile = ProfileRow(
+            wrench_sn="",
+            status=status,
+            consecutive_fail_count=count,
+            created_at="",
+        )
+    return status, count
 
 
 def _utc_now_iso() -> str:
@@ -129,10 +178,47 @@ class CalibrationService:
             history=[_to_record_response(record) for record in records],
         )
 
+    def void_record(
+        self, wrench_sn: str, seq: int, reason: str
+    ) -> CalibrationVoidResponse:
+        """作废一条误登记：标记记录、保存原因与作废时间，并按仍有效的
+        历史重放重算档案状态；全部在仓库的同一互斥写事务内原子完成。
+
+        序号不存在抛 :class:`CalibrationRecordNotFoundError`（事务内
+        尚未写入，直接回滚）；记录已作废抛
+        :class:`RecordAlreadyVoidedError`，档案保持不变。
+        """
+        with self._repo.void_transaction() as tx:
+            record = tx.get_record(wrench_sn, seq)
+            if record is None:
+                raise CalibrationRecordNotFoundError(wrench_sn, seq)
+            if not record.is_valid:
+                raise RecordAlreadyVoidedError(wrench_sn, seq)
+            voided_at = self._clock()
+            tx.mark_voided(wrench_sn, seq, reason=reason, voided_at=voided_at)
+            remaining = tx.list_valid_records(wrench_sn)
+            new_status, new_fail_count = replay_profile(remaining)
+            tx.update_profile(wrench_sn, new_status, new_fail_count)
+            total_records = tx.count_records(wrench_sn)
+
+        return CalibrationVoidResponse(
+            wrench_sn=wrench_sn,
+            voided_seq=seq,
+            void_reason=reason,
+            voided_at=voided_at,
+            status=new_status,
+            consecutive_fail_count=new_fail_count,
+            total_records=total_records,
+            valid_records=len(remaining),
+        )
+
 
 def _to_record_response(record: StoredRecord) -> CalibrationRecordResponse:
     return CalibrationRecordResponse(
         seq=record.seq,
         registered_at=record.registered_at,
+        is_valid=record.is_valid,
+        void_reason=record.void_reason,
+        voided_at=record.voided_at,
         **record.snapshot,
     )

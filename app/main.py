@@ -9,12 +9,20 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.calibration import CalibrationService, WrenchNotFoundError
+from app.calibration import (
+    CalibrationRecordNotFoundError,
+    CalibrationService,
+    RecordAlreadyVoidedError,
+    WrenchNotFoundError,
+)
 from app.calculator import verify_torque
 from app.db import CalibrationRepository
 from app.models import (
     CalibrationProfileResponse,
     CalibrationRegisterResponse,
+    CalibrationVoidRequest,
+    CalibrationVoidResponse,
+    SeqId,
     TorqueVerifyBatchRequest,
     TorqueVerifyBatchResponse,
     TorqueVerifyRequest,
@@ -40,11 +48,12 @@ def create_calibration_service(db_path: str | None = None) -> CalibrationService
 
 app = FastAPI(
     title="Torque Wrench Verification API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "装配线扭矩扳手复核：十进制定点计算，内部比较不舍入，"
         "响应展示四舍五入保留两位小数；校准档案按扳手编号纵向闭环，"
-        "由连续结果自动给出在用/观察/停用状态。"
+        "由连续结果自动给出在用/观察/停用状态；误登记可按编号与序号作废"
+        "（保留快照与原因），并按仍有效的历史重算档案状态。"
     ),
 )
 
@@ -86,7 +95,9 @@ async def request_validation_handler(
                     "所有数值须在 1.00–500.00 N·m 之间且最多两位小数，"
                     "measured_nm 必须恰好包含 5 个读数；"
                     "批量复核的 items 须包含 1–20 个测点；"
-                    "wrench_sn 路径参数须为非空白且不超过 64 字符的字符串。"
+                    "wrench_sn 路径参数须为非空白且不超过 64 字符的字符串；"
+                    "seq 路径参数须为从 1 起的正整数；"
+                    "作废原因 reason 须为 1–200 字的字符串。"
                 ),
                 "details": _sanitize_errors(exc.errors()),
             }
@@ -110,6 +121,52 @@ async def wrench_not_found_handler(
                         "loc": ["path", "wrench_sn"],
                         "type": "not_found",
                         "msg": "calibration profile not found",
+                    }
+                ],
+            }
+        },
+    )
+
+
+@app.exception_handler(CalibrationRecordNotFoundError)
+async def calibration_record_not_found_handler(
+    request: Request, exc: CalibrationRecordNotFoundError
+) -> JSONResponse:
+    """作废目标不存在：与未知编号同外形的结构化 404，不泄露其他档案。"""
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": {
+                "code": "CALIBRATION_RECORD_NOT_FOUND",
+                "message": "未找到该扳手编号与登记序号对应的校准记录。",
+                "details": [
+                    {
+                        "loc": ["path", "seq"],
+                        "type": "not_found",
+                        "msg": "calibration record not found",
+                    }
+                ],
+            }
+        },
+    )
+
+
+@app.exception_handler(RecordAlreadyVoidedError)
+async def record_already_voided_handler(
+    request: Request, exc: RecordAlreadyVoidedError
+) -> JSONResponse:
+    """重复作废：结构化 409 冲突，档案与历史均未被改动。"""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "code": "CALIBRATION_RECORD_ALREADY_VOIDED",
+                "message": "该登记序号已被作废，请勿重复作废。",
+                "details": [
+                    {
+                        "loc": ["path", "seq"],
+                        "type": "conflict",
+                        "msg": "calibration record already voided",
                     }
                 ],
             }
@@ -195,5 +252,31 @@ def get_calibration_profile(
     wrench_sn: WrenchId,
     service: CalibrationService = Depends(get_calibration_service),
 ) -> CalibrationProfileResponse:
-    """返回当前状态、连续不合格次数与按登记顺序排列的完整判定历史。"""
+    """返回当前状态、连续不合格次数与按登记顺序排列的完整判定历史。
+
+    历史包含已作废记录（携带 ``is_valid`` / ``void_reason`` /
+    ``voided_at`` 审计信息）；未作废记录的原字段保持不变。
+    """
     return service.get_profile(wrench_sn)
+
+
+@app.post(
+    "/api/v1/wrenches/{wrench_sn}/calibrations/{seq}/void",
+    response_model=CalibrationVoidResponse,
+    summary="作废一条误登记并按仍有效的历史重算档案状态",
+)
+def void_calibration(
+    wrench_sn: WrenchId,
+    seq: SeqId,
+    payload: CalibrationVoidRequest,
+    service: CalibrationService = Depends(get_calibration_service),
+) -> CalibrationVoidResponse:
+    """作废误登记（保留原快照与原因，不删除记录）。
+
+    原因非法在契约层整体拒绝（422，不写入）；序号不存在返回结构化
+    404；重复作废返回 409 且档案不变。作废成功后按登记顺序重放该
+    档案中仍有效的判定，重算当前状态与连续不合格次数。
+    """
+    # 纯编排：原因校验由契约层完成，标记/重放/回写由领域服务在同一
+    # 写事务内完成。
+    return service.void_record(wrench_sn, seq, payload.reason)
